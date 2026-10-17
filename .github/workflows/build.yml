@@ -1,5 +1,4 @@
-
-name: Build Drama3 CUDA
+name: Build Drama3 Windows CUDA
 
 on:
   workflow_dispatch:
@@ -10,62 +9,65 @@ jobs:
     timeout-minutes: 180
 
     steps:
-
-      # Download official audio.cpp source
-      - name: Get latest audio.cpp
+      - name: Checkout current audio.cpp
         uses: actions/checkout@v4
         with:
           repository: 0xShug0/audio.cpp
           ref: main
           submodules: recursive
+          persist-credentials: false
 
-      # Initialize Visual Studio C++ environment
-      - name: Setup MSVC
+      - name: Initialize MSVC x64
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # Install NVIDIA CUDA Toolkit
-      - name: Install CUDA
+      - name: Install CUDA 13.2
         uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: '13.2.0'
 
-      # Verify compiler availability
-      - name: Check compilers
+      - name: Verify compilers and CUDA smoke test
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
-          Write-Host "Checking MSVC..."
+          $ErrorActionPreference = 'Stop'
           where.exe cl
-          if ($LASTEXITCODE -ne 0) {
-            throw "MSVC compiler not found"
-          }
-
-          Write-Host "Checking CUDA..."
+          if ($LASTEXITCODE -ne 0) { throw 'cl.exe is unavailable' }
           nvcc --version
-          if ($LASTEXITCODE -ne 0) {
-            throw "CUDA compiler not found"
+          if ($LASTEXITCODE -ne 0) { throw 'nvcc is unavailable' }
+          if (-not $env:VSCMD_VER) { throw 'MSVC environment is missing' }
+          if (-not (Test-Path 'docs/models/fish_drama3.md')) {
+            throw 'Drama 3 files are not present in this checkout'
           }
+          @'
+          __global__ void test_kernel() {}
+          int main() { return 0; }
+          '@ | Set-Content -Path cuda_smoke.cu -Encoding ascii
+          nvcc --use-local-env -arch=sm_120a -c cuda_smoke.cu -o cuda_smoke.obj
+          if ($LASTEXITCODE -ne 0) { throw 'Standalone CUDA compile failed' }
+          Write-Host 'Standalone CUDA compilation succeeded'
 
-          Write-Host "Visual Studio environment:"
-          Write-Host $env:VSCMD_VER
-
-          if (-not $env:VSCMD_VER) {
-            throw "Visual Studio environment missing"
+      - name: Remove explicit CUDA host compiler override
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $scriptPath = 'scripts/build_windows.ps1'
+          $lines = @(Get-Content -LiteralPath $scriptPath)
+          $pattern = '^[ \t]*\$configureArgs[ \t]*\+=[ \t]*"-DCMAKE_CUDA_HOST_COMPILER='
+          $found = @($lines | Where-Object { $_ -match $pattern })
+          if ($found.Count -ne 1) {
+            throw "Expected 1 CUDA host compiler override, found $($found.Count). Stop to inspect upstream changes."
           }
+          $updated = @($lines | Where-Object { $_ -notmatch $pattern })
+          Set-Content -LiteralPath $scriptPath -Value $updated -Encoding utf8
+          Write-Host 'Removed the conflicting CMAKE_CUDA_HOST_COMPILER setting'
 
-      # Build Drama 3 with CUDA
-      - name: Build Drama3
+      - name: Configure and build Drama 3 CLI
         shell: pwsh
         env:
-          NVCC_PREPEND_FLAGS: "--use-local-env"
+          NVCC_PREPEND_FLAGS: '--use-local-env'
         run: |
-          $ErrorActionPreference = "Stop"
-
-          Write-Host "Building Drama 3 with CUDA..."
-
+          $ErrorActionPreference = 'Stop'
           .\scripts\build_windows.ps1 `
             -Preset windows-cuda-release `
             -ModelSet custom `
@@ -74,93 +76,54 @@ jobs:
             -CpuArch avx2 `
             -CudaArchitectures 120a-real `
             -Jobs 4
+          if ($LASTEXITCODE -ne 0) { throw 'audio.cpp build failed' }
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Drama 3 build failed"
-          }
-
-      # Package executables and dependencies
-      - name: Package
+      - name: Package the CLI and runtime DLLs
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
-          $bin = "build\windows-cuda-release\bin"
-          $out = "out"
-
-          if (!(Test-Path "$bin\audiocpp_cli.exe")) {
-            throw "audiocpp_cli.exe not found"
+          $ErrorActionPreference = 'Stop'
+          $bin = 'build/windows-cuda-release/bin'
+          if (-not (Test-Path "$bin/audiocpp_cli.exe")) {
+            throw 'audiocpp_cli.exe was not produced'
           }
-
-          New-Item -ItemType Directory -Force $out | Out-Null
-
-          # Copy binaries and GGML libraries
-          Copy-Item "$bin\*" "$out\" -Recurse -Force
-
-          # Copy model specifications
-          if (Test-Path "model_specs") {
-            Copy-Item "model_specs" "$out\model_specs" `
-              -Recurse -Force
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item -Path "$bin/*" -Destination package -Recurse -Force
+          Copy-Item -Path model_specs -Destination package/model_specs -Recurse -Force
+          $cudaDirs = @((Join-Path $env:CUDA_PATH 'bin'), (Join-Path $env:CUDA_PATH 'bin/x64'))
+          foreach ($dll in @('cublas64_13.dll', 'cublasLt64_13.dll', 'cufft64_12.dll')) {
+            $source = @($cudaDirs | ForEach-Object { Join-Path $_ $dll } | Where-Object { Test-Path $_ }) | Select-Object -First 1
+            if (-not $source) { throw "Missing CUDA runtime DLL: $dll" }
+            Copy-Item -LiteralPath $source -Destination package -Force
           }
-
-          # Copy required CUDA runtime libraries
-          $cudaDirs = @(
-            "$env:CUDA_PATH\bin",
-            "$env:CUDA_PATH\bin\x64"
-          )
-
-          $cudaPatterns = @(
-            "cublas64_*.dll",
-            "cublasLt64_*.dll",
-            "cudart64_*.dll",
-            "cufft64_*.dll"
-          )
-
-          foreach ($pattern in $cudaPatterns) {
-            $matches = @(
-              foreach ($dir in $cudaDirs) {
-                if (Test-Path $dir) {
-                  Get-ChildItem -Path $dir `
-                    -Filter $pattern -File
-                }
+          $redistDirs = @()
+          foreach ($vsRoot in @(
+            'C:/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Redist/MSVC',
+            'C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Redist/MSVC'
+          )) {
+            if (Test-Path $vsRoot) {
+              foreach ($version in (Get-ChildItem $vsRoot -Directory)) {
+                $redistDirs += (Join-Path $version.FullName 'x64/Microsoft.VC143.CRT')
+                $redistDirs += (Join-Path $version.FullName 'x64/Microsoft.VC143.OpenMP')
               }
-            )
-
-            if ($matches.Count -eq 0) {
-              throw "Missing CUDA runtime: $pattern"
-            }
-
-            foreach ($file in $matches) {
-              Copy-Item $file.FullName "$out\" -Force
             }
           }
-
-          # Copy Microsoft C++ runtime DLLs
-          $msvcDlls = @(
-            "msvcp140.dll",
-            "msvcp140_1.dll",
-            "msvcp140_2.dll",
-            "msvcp140_atomic_wait.dll",
-            "vcruntime140.dll",
-            "vcruntime140_1.dll",
-            "vcomp140.dll"
-          )
-
-          foreach ($dll in $msvcDlls) {
-            $source = Join-Path $env:WINDIR "System32\$dll"
-            if (Test-Path $source) {
-              Copy-Item $source "$out\" -Force
-            }
+          $runtimeDirs = @((Join-Path $env:WINDIR 'System32')) + $redistDirs
+          foreach ($dll in @('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll', 'vcomp140.dll')) {
+            $source = @($runtimeDirs | ForEach-Object { Join-Path $_ $dll } | Where-Object { Test-Path $_ }) | Select-Object -First 1
+            if (-not $source) { throw "Missing required MSVC/OpenMP DLL: $dll" }
+            Copy-Item -LiteralPath $source -Destination package -Force
           }
+          foreach ($dll in @('cudart64_13.dll', 'msvcp140_1.dll', 'msvcp140_2.dll', 'msvcp140_atomic_wait.dll')) {
+            $dirs = $runtimeDirs + $cudaDirs
+            $source = @($dirs | ForEach-Object { Join-Path $_ $dll } | Where-Object { Test-Path $_ }) | Select-Object -First 1
+            if ($source) { Copy-Item -LiteralPath $source -Destination package -Force }
+          }
+          Get-ChildItem package | Select-Object Name, Length
 
-          Write-Host "Package contents:"
-          Get-ChildItem $out | Select-Object Name, Length
-
-      # Create downloadable artifact
-      - name: Upload Windows build
+      - name: Upload ZIP artifact
         uses: actions/upload-artifact@v4
         with:
           name: Drama3-Windows-RTX5060Ti
-          path: out/
-          retention-days: 7
+          path: package/
           if-no-files-found: error
+          retention-days: 7

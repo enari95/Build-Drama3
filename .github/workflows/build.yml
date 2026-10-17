@@ -1,4 +1,5 @@
-name: Build Drama3 Windows CUDA
+
+name: Build Drama3 Windows CUDA + WebUI
 
 on:
   workflow_dispatch:
@@ -62,6 +63,22 @@ jobs:
           Set-Content -LiteralPath $scriptPath -Value $updated -Encoding utf8
           Write-Host 'Removed the conflicting CMAKE_CUDA_HOST_COMPILER setting'
 
+      - name: Prepare embedded WebUI assets
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build embedded browser UI
+        shell: pwsh
+        working-directory: webui/native
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'WebUI build failed' }
+          if (-not (Test-Path 'dist/index.html')) { throw 'Embedded UI file was not produced' }
+
       - name: Configure and build Drama 3 CLI
         shell: pwsh
         env:
@@ -69,6 +86,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           .\scripts\build_windows.ps1 `
+            -NativeModelManager `
             -Preset windows-cuda-release `
             -ModelSet custom `
             -Models fish_drama3 `
@@ -78,23 +96,44 @@ jobs:
             -Jobs 4
           if ($LASTEXITCODE -ne 0) { throw 'audio.cpp build failed' }
 
-      - name: Package the CLI and runtime DLLs
+      - name: Build Drama 3 WebUI server
+        shell: pwsh
+        env:
+          NVCC_PREPEND_FLAGS: '--use-local-env'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\scripts\build_windows.ps1 `
+            -NativeModelManager `
+            -Preset windows-cuda-release `
+            -ModelSet custom `
+            -Models fish_drama3 `
+            -Target audiocpp_server `
+            -CpuArch avx2 `
+            -CudaArchitectures 120a-real `
+            -Jobs 4
+          if ($LASTEXITCODE -ne 0) { throw 'audio.cpp WebUI server build failed' }
+
+      - name: Package the CLI, server and runtime DLLs
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $bin = 'build/windows-cuda-release/bin'
-          if (-not (Test-Path "$bin/audiocpp_cli.exe")) {
-            throw 'audiocpp_cli.exe was not produced'
+          foreach ($exe in @('audiocpp_cli.exe', 'audiocpp_server.exe')) {
+            if (-not (Test-Path (Join-Path $bin $exe))) {
+              throw "$exe was not produced"
+            }
           }
           New-Item -ItemType Directory -Force -Path package | Out-Null
           Copy-Item -Path "$bin/*" -Destination package -Recurse -Force
           Copy-Item -Path model_specs -Destination package/model_specs -Recurse -Force
+
           $cudaDirs = @((Join-Path $env:CUDA_PATH 'bin'), (Join-Path $env:CUDA_PATH 'bin/x64'))
           foreach ($dll in @('cublas64_13.dll', 'cublasLt64_13.dll', 'cufft64_12.dll')) {
             $source = @($cudaDirs | ForEach-Object { Join-Path $_ $dll } | Where-Object { Test-Path $_ }) | Select-Object -First 1
             if (-not $source) { throw "Missing CUDA runtime DLL: $dll" }
             Copy-Item -LiteralPath $source -Destination package -Force
           }
+
           $redistDirs = @()
           foreach ($vsRoot in @(
             'C:/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Redist/MSVC',
@@ -107,23 +146,34 @@ jobs:
               }
             }
           }
+
           $runtimeDirs = @((Join-Path $env:WINDIR 'System32')) + $redistDirs
           foreach ($dll in @('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll', 'vcomp140.dll')) {
             $source = @($runtimeDirs | ForEach-Object { Join-Path $_ $dll } | Where-Object { Test-Path $_ }) | Select-Object -First 1
             if (-not $source) { throw "Missing required MSVC/OpenMP DLL: $dll" }
             Copy-Item -LiteralPath $source -Destination package -Force
           }
+
           foreach ($dll in @('cudart64_13.dll', 'msvcp140_1.dll', 'msvcp140_2.dll', 'msvcp140_atomic_wait.dll')) {
             $dirs = $runtimeDirs + $cudaDirs
             $source = @($dirs | ForEach-Object { Join-Path $_ $dll } | Where-Object { Test-Path $_ }) | Select-Object -First 1
             if ($source) { Copy-Item -LiteralPath $source -Destination package -Force }
           }
+
+          @'
+          @echo off
+          cd /d "%~dp0"
+          start "" "http://127.0.0.1:8080"
+          "%~dp0audiocpp_server.exe" --ui --ui-management --backend cuda
+          pause
+          '@ | Set-Content -Path package/start_drama3_ui.bat -Encoding ascii
+
           Get-ChildItem package | Select-Object Name, Length
 
       - name: Upload ZIP artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Drama3-Windows-RTX5060Ti
+          name: Drama3-Windows-RTX5060Ti-WebUI
           path: package/
           if-no-files-found: error
           retention-days: 7

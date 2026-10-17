@@ -1,0 +1,166 @@
+
+name: Build Drama3 CUDA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    steps:
+
+      # Download official audio.cpp source
+      - name: Get latest audio.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: 0xShug0/audio.cpp
+          ref: main
+          submodules: recursive
+
+      # Initialize Visual Studio C++ environment
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # Install NVIDIA CUDA Toolkit
+      - name: Install CUDA
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '13.2.0'
+
+      # Verify compiler availability
+      - name: Check compilers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Checking MSVC..."
+          where.exe cl
+          if ($LASTEXITCODE -ne 0) {
+            throw "MSVC compiler not found"
+          }
+
+          Write-Host "Checking CUDA..."
+          nvcc --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "CUDA compiler not found"
+          }
+
+          Write-Host "Visual Studio environment:"
+          Write-Host $env:VSCMD_VER
+
+          if (-not $env:VSCMD_VER) {
+            throw "Visual Studio environment missing"
+          }
+
+      # Build Drama 3 with CUDA
+      - name: Build Drama3
+        shell: pwsh
+        env:
+          NVCC_PREPEND_FLAGS: "--use-local-env"
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Building Drama 3 with CUDA..."
+
+          .\scripts\build_windows.ps1 `
+            -Preset windows-cuda-release `
+            -ModelSet custom `
+            -Models fish_drama3 `
+            -Target audiocpp_cli `
+            -CpuArch avx2 `
+            -CudaArchitectures 120a-real `
+            -Jobs 4
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Drama 3 build failed"
+          }
+
+      # Package executables and dependencies
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $bin = "build\windows-cuda-release\bin"
+          $out = "out"
+
+          if (!(Test-Path "$bin\audiocpp_cli.exe")) {
+            throw "audiocpp_cli.exe not found"
+          }
+
+          New-Item -ItemType Directory -Force $out | Out-Null
+
+          # Copy binaries and GGML libraries
+          Copy-Item "$bin\*" "$out\" -Recurse -Force
+
+          # Copy model specifications
+          if (Test-Path "model_specs") {
+            Copy-Item "model_specs" "$out\model_specs" `
+              -Recurse -Force
+          }
+
+          # Copy required CUDA runtime libraries
+          $cudaDirs = @(
+            "$env:CUDA_PATH\bin",
+            "$env:CUDA_PATH\bin\x64"
+          )
+
+          $cudaPatterns = @(
+            "cublas64_*.dll",
+            "cublasLt64_*.dll",
+            "cudart64_*.dll",
+            "cufft64_*.dll"
+          )
+
+          foreach ($pattern in $cudaPatterns) {
+            $matches = @(
+              foreach ($dir in $cudaDirs) {
+                if (Test-Path $dir) {
+                  Get-ChildItem -Path $dir `
+                    -Filter $pattern -File
+                }
+              }
+            )
+
+            if ($matches.Count -eq 0) {
+              throw "Missing CUDA runtime: $pattern"
+            }
+
+            foreach ($file in $matches) {
+              Copy-Item $file.FullName "$out\" -Force
+            }
+          }
+
+          # Copy Microsoft C++ runtime DLLs
+          $msvcDlls = @(
+            "msvcp140.dll",
+            "msvcp140_1.dll",
+            "msvcp140_2.dll",
+            "msvcp140_atomic_wait.dll",
+            "vcruntime140.dll",
+            "vcruntime140_1.dll",
+            "vcomp140.dll"
+          )
+
+          foreach ($dll in $msvcDlls) {
+            $source = Join-Path $env:WINDIR "System32\$dll"
+            if (Test-Path $source) {
+              Copy-Item $source "$out\" -Force
+            }
+          }
+
+          Write-Host "Package contents:"
+          Get-ChildItem $out | Select-Object Name, Length
+
+      # Create downloadable artifact
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Drama3-Windows-RTX5060Ti
+          path: out/
+          retention-days: 7
+          if-no-files-found: error
